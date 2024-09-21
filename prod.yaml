@@ -1,0 +1,64 @@
+name: Build, Push & Deploy
+
+on:
+  release:
+    types:
+      - published
+
+env:
+  GITHUB_RELEASE_TAG: ${{ github.event.release.tag_name }} 
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    environment: dev
+
+    outputs:
+      cloud_run_url: ${{ steps.deploy.outputs.cloud_run_url }}
+
+    steps:
+
+    - name: code checkout
+      uses: actions/checkout@v2
+
+    - uses: sonarsource/sonarqube-scan-action@master
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+    # If you wish to fail your job when the Quality Gate is red, uncomment the
+    # following lines. This would typically be used to fail a deployment.
+    # - uses: sonarsource/sonarqube-quality-gate-action@master
+    #   timeout-minutes: 5
+    #   env:
+    #     SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+    - id: 'auth'
+      uses: 'google-github-actions/auth@v2'
+      with:
+        credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+    - name: 'Set up Cloud SDK'
+      uses: 'google-github-actions/setup-gcloud@v2'
+
+    - name: 'Use gcloud CLI'
+      run: 'gcloud info'
+
+    - name: build and push the docker image
+      run: |
+        gcloud auth configure-docker asia-south1-docker.pkg.dev
+        docker build --build-arg ENV=prod -t asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/${{ secrets.IMAGE_NAME }}:${{ env.GITHUB_RELEASE_TAG }} .
+        docker push asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/${{ secrets.IMAGE_NAME }}:${{ env.GITHUB_RELEASE_TAG }}
+
+    - name: Deploy to Cloud Run
+      id: deploy
+      run: |
+        DEPLOY_OUTPUT=$(gcloud run deploy ${{ secrets.IMAGE_NAME }} \
+          --image asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/${{ secrets.IMAGE_NAME }}:${{ env.GITHUB_RELEASE_TAG }} \
+          --region asia-south1 \
+          --platform managed \
+          --allow-unauthenticated \
+          --port ${{ secrets.CONTAINER_PORT }} \
+          --format 'value(status.url)')

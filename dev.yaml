@@ -1,0 +1,76 @@
+name: Checkout, Docker Build, Automated Test & Report, Push_Docker_Image & Slack Notification
+
+on:
+  push:
+    branches:
+      - dev
+
+env:
+  GITHUB_RELEASE_TAG: dev
+
+jobs:
+  build-test-push-notify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    environment: dev
+
+    steps:
+    - name: Checkout GitHub Code
+      uses: actions/checkout@v4
+
+    - uses: sonarsource/sonarqube-scan-action@master
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+    # If you wish to fail your job when the Quality Gate is red, uncomment the
+    # following lines. This would typically be used to fail a deployment.
+    # - uses: sonarsource/sonarqube-quality-gate-action@master
+    #   timeout-minutes: 5
+    #   env:
+    #     SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+    - id: 'auth'
+      uses: 'google-github-actions/auth@v2'
+      with:
+        credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+    - name: 'Set up Cloud SDK'
+      uses: 'google-github-actions/setup-gcloud@v2'
+
+    - name: 'Use gcloud CLI'
+      run: 'gcloud info'
+
+    - name: build and push the docker image
+      run: |
+        gcloud auth configure-docker asia-south1-docker.pkg.dev
+        docker build --build-arg ENV=dev -t asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/${{ secrets.IMAGE_NAME }}:${{ env.GITHUB_RELEASE_TAG }} .
+        docker push asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/${{ secrets.IMAGE_NAME }}:${{ env.GITHUB_RELEASE_TAG }}
+
+    - name: SSH into VM and deploy
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.VM_IP }}
+        username: ${{ secrets.VM_USERNAME }}
+        key: ${{ secrets.VM_KEY }}
+        port: ${{ secrets.VM_PORT }}
+        script: |
+          # Check if Docker image exists
+          if [ "$(docker images -q asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/${{ secrets.IMAGE_NAME }}:${{ env.GITHUB_RELEASE_TAG }})" ]; then
+            # Check if container is running and stop it
+            if [ "$(docker ps -q -f name=${{ secrets.CONTAINER_NAME }})" ]; then
+              docker stop ${{ secrets.CONTAINER_NAME }}
+            fi
+            # Remove the container
+            docker rm ${{ secrets.CONTAINER_NAME }}
+            docker system prune -a -f
+          fi
+          # GCP Authentication
+          export GOOGLE_APPLICATION_CREDENTIALS="/home/user/Documents/prj-ltts-com-api-hub-94ea1e1131e0.json"
+          gcloud auth print-access-token --impersonate-service-account api-hub-cloudrun-sa@prj-ltts-com-api-hub.iam.gserviceaccount.com | docker login -u oauth2accesstoken --password-stdin https://asia-south1-docker.pkg.dev
+          # Run the new container
+          docker run --restart always -d --name ${{ secrets.CONTAINER_NAME }} -p ${{ secrets.CONTAINER_PORT }}:${{ secrets.CONTAINER_PORT }} asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/${{ secrets.IMAGE_NAME }}:${{ env.GITHUB_RELEASE_TAG }}
+
+      
+
